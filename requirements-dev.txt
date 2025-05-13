@@ -1,0 +1,5 @@
+pytest
+hypothesis
+scapy
+mac-vendor-lookup
+coverage
