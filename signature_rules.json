@@ -1,0 +1,56 @@
+[
+  {
+    "name": "SQL Injection",
+    "pattern": "UNION\\s+SELECT|DROP\\s+TABLE|OR\\s+1=1",
+    "category": "Injection",
+    "severity": "High"
+  },
+  {
+    "name": "XSS Attempt",
+    "pattern": "<script\\b[^>]*>(.*?)<\\/script>",
+    "category": "Cross-Site Scripting",
+    "severity": "Medium"
+  },
+  {
+    "name": "Suspicious User-Agent",
+    "pattern": "sqlmap",
+    "category": "Reconnaissance",
+    "severity": "High"
+  },
+  {
+    "name": "Suspicious DNS Query",
+    "pattern": "malicious\\.example\\.com",
+    "category": "DNS Tunneling",
+    "severity": "Medium"
+  },
+  {
+  "name": "Suspicious TLS SNI",
+  "pattern": "evil\\.example\\.com",
+  "category": "TLS Abuse",
+  "severity": "High"
+  },
+  {
+  "name": "Test HTTP Header",
+  "pattern": "X-Test-Alert",
+  "category": "Test",
+  "severity": "Low"
+  },
+  {
+  "name": "Test DNS Query",
+  "pattern": "badtest\\.local",
+  "category": "Test",
+  "severity": "Medium"
+  },
+  {
+  "name": "Test TLS SNI",
+  "pattern": "sni-test\\.example",
+  "category": "TLS Test",
+  "severity": "High"
+  },
+  {
+  "name": "Test Raw",
+  "pattern": "RAWPAYLOAD123",
+  "category": "Test",
+  "severity": "Low"
+  }
+]
