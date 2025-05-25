@@ -10,12 +10,14 @@ import platform
 import time
 import sys
 import datetime
+import requests
 from scapy.layers.l2 import ARP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.inet import TCP, UDP, ICMP, IP
 from scapy.layers.http import HTTPRequest, HTTPResponse
 from scapy.layers.dns import DNSQR, DNSRR
 from scapy.layers.tls.all import TLSClientHello
+from scapy.all import rdpcap
 from scapy.all import (
     sniff, Ether, wrpcap, get_if_hwaddr,
     get_if_list, hexdump, load_layer
@@ -25,6 +27,7 @@ from mac_vendor_lookup import MacLookup
 
 import customtkinter as ctk
 from tkinter import ttk, messagebox
+from tkinter import messagebox, filedialog
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
@@ -92,6 +95,33 @@ def build_iface_map():
                     mapping[name] = dev
                     break
     return mapping
+
+class GeoIPResolver:
+    def __init__(self):
+        self.cache = {}
+
+    def lookup(self, ip):
+        if ip in self.cache:
+            return self.cache[ip]
+
+        # Skip local/private IPs
+        if ip.startswith("192.") or ip.startswith("10.") or ip.startswith("172.") or ip.startswith("127.") or ip.startswith("::1"):
+            self.cache[ip] = "Local Network"
+            return "Local Network"
+
+        try:
+            url = f"https://ipinfo.io/{ip}/json"
+            response = requests.get(url, timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                loc = f"{data.get('city', '')}, {data.get('country', '')}".strip(', ')
+                self.cache[ip] = loc or "Unknown"
+                return self.cache[ip]
+        except Exception:
+            pass
+
+        self.cache[ip] = "Unknown"
+        return "Unknown"
 
 # ── Signature-Based Detection ──
 class SignatureDetector:
@@ -250,8 +280,7 @@ class SignatureDetector:
                 matches.append(alert)
 
         return matches
-    
-    
+
     def load_rules(self):
         base = os.path.dirname(os.path.abspath(__file__))
         path = os.path.join(base, self.rule_file)
@@ -317,7 +346,6 @@ class AnomalyDetector:
         self.update(length)
         return alerts
 
-
 # ── Alert Manager ──
 class AlertManager:
     def __init__(self, gui=None):
@@ -332,7 +360,6 @@ class AlertManager:
             self.gui.alert_text.configure(state='disabled')
             self.gui.alert_text.see('end')
 
-
 # Globals
 packet_queue     = queue.Queue()
 stop_sniff_event = threading.Event()
@@ -343,23 +370,20 @@ sig_det  = SignatureDetector('signature_rules.json')
 anom_det = AnomalyDetector()
 alerts   = AlertManager()  # will be re-bound to GUI below
 
-
-def process_packet_gui(packet, local_mac, vendor_lookup=None):
+def process_packet_gui(packet, local_mac, gui, vendor_lookup=None):
     if Ether not in packet:
         return
-
-        # Run detections
-    for m in sig_det.inspect(packet):
+    
+    # Run detections
+    for m in gui.sig_det.inspect(packet):
         print("[SIG DETECTED]", m)
-        alerts.notify(m, severity="HIGH")
+        gui.alerts.notify(m, severity="HIGH")
 
-    for m in anom_det.inspect(packet):
-        alerts.notify(m, severity="MEDIUM")
-
-    gui_packets.append(packet)
-
+    for m in gui.anom_det.inspect(packet):
+        gui.alerts.notify(m, severity="MEDIUM")
+        
     # Timestamp
-    dt = datetime.datetime.fromtimestamp(packet.time)
+    dt = datetime.datetime.fromtimestamp(float(packet.time))
     ts = dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
     proto = src = dst = sport = dport = ""
@@ -401,6 +425,7 @@ def process_packet_gui(packet, local_mac, vendor_lookup=None):
     packet_queue.put(packet)
 
 class SnifferApp(ctk.CTk):
+    MAX_PACKETS = 1000  # Limit memory usage and improve GUI responsiveness
     def __init__(self, interface, pcap_file, csv_file):
         super().__init__()
         self.interface = interface
@@ -408,6 +433,9 @@ class SnifferApp(ctk.CTk):
         self.csv_file = csv_file
         self.vendor = MacLookup()
         self.local_mac = get_if_hwaddr(interface).upper() 
+        self.geoip = GeoIPResolver()
+        self.protocol_counts = {'TCP': 0, 'UDP': 0, 'ICMP': 0, 'ARP': 0, 'Other': 0}
+        self.byte_rate_history = []
 
         # ── Theme setup ──
         ctk.set_appearance_mode('Light')
@@ -422,7 +450,6 @@ class SnifferApp(ctk.CTk):
         style.configure("Treeview.Heading", font=("Arial", 30, "bold"))
         style.configure("Treeview",         font=("Arial", 14))
         style.configure("Treeview",         rowheight=30)
-
 
         # load signature & anomaly detectors
         self.sig_det = SignatureDetector('signature_rules.json')
@@ -448,18 +475,24 @@ class SnifferApp(ctk.CTk):
         self._build_alerts_panel()
 
         # Start loops
-        self.after(100, self.poll_queue)
+        self.after(300, self.poll_queue)
         self.after(1000, self.update_bandwidth_metrics)
+        self.after(5000, self.update_protocol_chart)
 
-    
+
+        self.last_tree_index = 0
+        self.mac_vendor_cache = {}
+        
+
     def _build_capture_controls(self):
         frame = ctk.CTkFrame(self, corner_radius=8)
         frame.grid(row=0, column=0, sticky='ew', padx=10, pady=5)
 
-        # ─── Prevent EVERY column from expanding except the last one ───
-        for col in range(0,  7):    # replace nine with however many columns you're using
+        # Configure grid columns and rows
+        for col in range(0, 10):  # allow space for extra buttons
             frame.grid_columnconfigure(col, weight=0)
-        frame.grid_columnconfigure( 7, weight=1)  # final spacer column
+        frame.grid_columnconfigure(10, weight=1)  # final spacer column
+        frame.grid_rowconfigure(1, weight=0)      # allow row 1 for buttons
 
         # ─── Column 0: Controller dropdown ───
         iface_map = build_iface_map()
@@ -477,25 +510,25 @@ class SnifferApp(ctk.CTk):
 
         # ─── Column 1 & 2: BPF filter label + entry ───
         ctk.CTkLabel(frame, text="BPF Filter:", font=self.text_font)\
-        .grid(row=0, column=1, padx=(10,2), sticky='e')
+            .grid(row=0, column=1, padx=(10, 2), sticky='e')
         ctk.CTkEntry(
             frame,
             placeholder_text='e.g. tcp port 80',
             textvariable=self.capture_filter_var,
             width=150,
             font=self.text_font
-        ).grid(row=0, column=2, padx=(2,10))
+        ).grid(row=0, column=2, padx=(2, 10))
 
         # ─── Column 3 & 4: Display filter label + entry ───
         ctk.CTkLabel(frame, text="Display Filter:", font=self.text_font)\
-        .grid(row=0, column=3, padx=(10,2), sticky='e')
+            .grid(row=0, column=3, padx=(10, 2), sticky='e')
         ctk.CTkEntry(
             frame,
             placeholder_text='e.g. http',
             textvariable=self.display_filter_var,
             width=150,
             font=self.text_font
-        ).grid(row=0, column=4, padx=(2,10))
+        ).grid(row=0, column=4, padx=(2, 10))
 
         # ─── Column 5: Start / Stop ───
         self.start_btn = ctk.CTkButton(
@@ -510,65 +543,120 @@ class SnifferApp(ctk.CTk):
         )
         self.stop_btn.grid(row=0, column=6, padx=5)
 
-        # ─── Columns 7–10: Other buttons ───
-        other = [
-            ('Categories…',      self.open_category_window),
-            ('Reload Rules',     self.reload_rules),
-            ('Save PCAP',        self.save_pcap),
-            ('Save CSV',         self.save_csv),
+        # ─── Row 0 Buttons (column 7+) ───
+        row0_buttons = [
+            ('Categories…',  self.open_category_window),
+            ('Reload Rules', self.reload_rules)
         ]
-        for idx, (txt, cmd) in enumerate(other, start=7):
+
+        # ─── Row 1 Buttons (below) ───
+        row1_buttons = [
+            ('Save PCAP',    self.save_pcap),
+            ('Save CSV',     self.save_csv),
+             ('Load PCAP...', self.load_pcap),
+            ('Test Rule...', self.open_rule_test_panel)
+        ]
+
+        for idx, (txt, cmd) in enumerate(row0_buttons, start=7):
             ctk.CTkButton(
                 frame, text=txt, command=cmd,
                 width=100, height=28, font=self.text_font
-            ).grid(row=0, column=idx, padx=4)
+            ).grid(row=0, column=idx, padx=3)
 
+        row1_columns = [5, 6, 7, 8]  # Align under Start, Stop, and one new column
+        for idx, (txt, cmd) in zip(row1_columns, row1_buttons):
+            ctk.CTkButton(
+                frame, text=txt, command=cmd,
+                width=80, height=28, font=self.text_font
+            ).grid(row=1, column=idx, padx=4, pady=(3, 0))
 
     def _build_paned_view(self):
         pane = ctk.CTkFrame(self)
         pane.grid(row=1, column=0, columnspan=4, rowspan=2, sticky='nsew', padx=10, pady=5)
-        self.rowconfigure(1, weight=1); self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        # Define styles for fonts here (insert this new section)
+        style = ttk.Style(self)
+        style.configure("Treeview", font=("Arial", 25))  # Increased size for main packet table
+        style.configure("Treeview.Heading", font=("Arial", 25, "bold"))
+        style.configure("TopTalkers.Treeview", font=("Arial", 25))  # Increased size for top talkers
+        style.configure("TopTalkers.Treeview.Heading", font=("Arial", 25, "bold"))
 
         # Left: table
         tbl_frame = ctk.CTkFrame(pane, corner_radius=8)
         tbl_frame.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
-        cols=['Time','Src IP','Dst IP','Proto','SP','DP','Len']
+        cols = ['Time', 'Src IP', 'Dst IP', 'Proto', 'SP', 'DP', 'Len']
         self.tree = ttk.Treeview(tbl_frame, columns=cols, show='headings')
+
         for c in cols:
-            self.tree.heading(c, text=c); self.tree.column(c,width=100)
+            if c == 'Src IP':
+                self.tree.heading(c, text=c, anchor='w')
+                self.tree.column(c, width=140, anchor='w', stretch=True)
+            else:
+                self.tree.heading(c, text=c, anchor='center')
+                self.tree.column(c, width=120, anchor='center', stretch=True)
 
         self.tree.pack(fill='both', expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self.on_row_click)
 
         # Middle: metrics
         met_frame = ctk.CTkFrame(pane, corner_radius=8)
         met_frame.grid(row=0, column=1, sticky='nsew', padx=5, pady=5)
         ctk.CTkLabel(met_frame, text='Live Metrics', font=('Arial', 16)).pack(pady=5)
-        self.lbl_pkts  = ctk.CTkLabel(met_frame, text='Packets: 0',     font=self.text_font)
+        self.lbl_pkts = ctk.CTkLabel(met_frame, text='Packets: 0', font=self.text_font)
         self.lbl_bytes = ctk.CTkLabel(met_frame, text='Total Bytes: 0', font=self.text_font)
-        self.lbl_rate  = ctk.CTkLabel(met_frame, text='Bytes/sec: 0',   font=self.text_font)
+        self.lbl_rate = ctk.CTkLabel(met_frame, text='Bytes/sec: 0', font=self.text_font)
 
-        for w in (self.lbl_pkts, self.lbl_bytes, self.lbl_rate): w.pack(anchor='w', padx=10)
+        for w in (self.lbl_pkts, self.lbl_bytes, self.lbl_rate):
+            w.pack(anchor='w', padx=10)
+
         # chart
-        fig = Figure(figsize=(3,2)); ax=fig.add_subplot(111); self.line,=ax.plot([])
-        canvas=FigureCanvasTkAgg(fig,master=met_frame); canvas.get_tk_widget().pack(fill='both',expand=True)
+        fig = Figure(figsize=(3, 2))
+        ax = fig.add_subplot(111)
+        self.line, = ax.plot([])
+        canvas = FigureCanvasTkAgg(fig, master=met_frame)
+        canvas.get_tk_widget().pack(fill='both', expand=True)
         self.chart_ax, self.chart_canvas = ax, canvas
 
         # Right: top talkers
         top_frame = ctk.CTkFrame(pane, corner_radius=8)
         top_frame.grid(row=0, column=2, sticky='nsew', padx=5, pady=5)
-        ctk.CTkLabel(top_frame, text='Top Talkers', font=('Arial',16)).pack(pady=5)
-        self.talker = ttk.Treeview(top_frame, columns=('IP','Bytes'), show='headings', height=5)
-        self.talker.heading('IP',text='IP'); self.talker.heading('Bytes',text='Bytes')
-        self.talker.pack(fill='both',expand=True)
+        ctk.CTkLabel(top_frame, text='Top Talkers', font=('Arial', 16)).pack(pady=5)
 
-        pane.columnconfigure(0,weight=3); pane.columnconfigure(1,weight=1); pane.columnconfigure(2,weight=1)
-        pane.rowconfigure(0,weight=1)
+        self.talker = ttk.Treeview(
+            top_frame,
+            columns=('IP', 'Bytes'),
+            show='headings',
+            height=5,
+            style="TopTalkers.Treeview"  # Apply the new style here
+        )      
+        # Left-align headers and cell data
+        self.talker.heading('IP', text='IP', anchor='w')
+        self.talker.heading('Bytes', text='Bytes', anchor='w')
+        self.talker.column('IP', anchor='w', width=180, stretch=True)
+        self.talker.column('Bytes', anchor='w', width=80, stretch=True)
 
+        self.talker.pack(fill='both', expand=True)
+        
+        # ── Protocol Pie Chart ──
+        ctk.CTkLabel(top_frame, text='Protocol Breakdown', font=('Arial', 16)).pack(pady=(15, 5))
+
+        fig2 = Figure(figsize=(3, 2))
+        self.ax_protocol = fig2.add_subplot(111)
+        self.pie_chart = FigureCanvasTkAgg(fig2, master=top_frame)
+        self.pie_chart.get_tk_widget().pack(fill='both', expand=True)
+
+        pane.columnconfigure(0, weight=5)
+        pane.columnconfigure(1, weight=1)
+        pane.columnconfigure(2, weight=1)
+        pane.rowconfigure(0, weight=1)
+ 
     def _build_alerts_panel(self):
         frame = ctk.CTkFrame(self, corner_radius=8)
-        frame.grid(row=3, column=0, columnspan=4, sticky='ew', padx=10, pady=5)
+        frame.grid(row=3, column=0, columnspan=4, sticky='ew', padx=6, pady=5)
         ctk.CTkLabel(frame, text='Alerts', font=('Arial',16)).pack(anchor='w', pady=5)
-        self.alert_text = ctk.CTkTextbox(frame, height=6)
+        self.alert_text = ctk.CTkTextbox(frame, height=60)
         self.alert_text.pack(fill='both', expand=True)
 
     # -- Capture callbacks --
@@ -578,7 +666,7 @@ class SnifferApp(ctk.CTk):
         self.start_btn.configure(state='disabled'); self.stop_btn.configure(state='normal')
         threading.Thread(target=lambda: sniff(
             iface=iface, filter=self.capture_filter_var.get() or None,
-            prn=lambda p: process_packet_gui(p, self.local_mac, self.vendor),
+            prn=lambda p: process_packet_gui(p, self.local_mac, self, self.vendor),
             store=True, promisc=True,
             stop_filter=lambda p: stop_sniff_event.is_set()
         ), daemon=True).start()
@@ -599,56 +687,363 @@ class SnifferApp(ctk.CTk):
         messagebox.showinfo('Save PCAP', self.pcap_file)
 
     def open_category_window(self):
-        # implement similar to earlier but with CTkCheckBox
-        pass
+        # Prevent multiple windows
+        if hasattr(self, 'cat_win') and self.cat_win.winfo_exists():
+            self.cat_win.focus()
+            return
+
+        self.cat_win = ctk.CTkToplevel(self)
+        self.cat_win.title("Signature Categories")
+        self.cat_win.geometry("300x400")
+
+        ctk.CTkLabel(self.cat_win, text="Enable/Disable Signature Categories", font=self.header_font)\
+            .pack(pady=10)
+
+        current_cats = self.sig_det.enabled_categories
+        all_cats = sorted({r['category'] for r in self.sig_det.rules})
+        self.cat_vars = {}
+
+        for cat in all_cats:
+            var = ctk.BooleanVar(value=cat in current_cats)
+            chk = ctk.CTkCheckBox(self.cat_win, text=cat, variable=var)
+            chk.pack(anchor='w', padx=20, pady=2)
+            self.cat_vars[cat] = var
+
+        def apply_changes():
+            selected = [cat for cat, var in self.cat_vars.items() if var.get()]
+            self.sig_det.set_enabled_categories(selected)
+            self.cat_win.destroy()
+
+        ctk.CTkButton(self.cat_win, text="Apply", command=apply_changes).pack(pady=10)
 
     # -- Poll & update --
+    
     def poll_queue(self):
         try:
             while True:
-                pkt=packet_queue.get_nowait(); self.all_packets.append(pkt)
-                length=len(pkt); self.total_bytes+=length; self.bytes_last+=length
+                pkt = packet_queue.get_nowait()
+                self.all_packets.append(pkt)
+                if len(self.all_packets) > self.MAX_PACKETS:
+                    self.all_packets.pop(0)
+                length = len(pkt)
+                self.total_bytes += length
+                self.bytes_last += length
+
                 src = pkt[IP].src if IP in pkt else pkt[IPv6].src if IPv6 in pkt else None
-                if src: self.bytes_per_src[src]=self.bytes_per_src.get(src,0)+length
+                if src:
+                    self.bytes_per_src[src] = self.bytes_per_src.get(src, 0) + length
+
+                # Protocol counting
+                if ARP in pkt:
+                    self.protocol_counts['ARP'] += 1
+                elif IP in pkt:
+                    p = pkt[IP].proto
+                    if p == 6:
+                        self.protocol_counts['TCP'] += 1
+                    elif p == 17:
+                        self.protocol_counts['UDP'] += 1
+                    elif p == 1:
+                        self.protocol_counts['ICMP'] += 1
+                    else:
+                        self.protocol_counts['Other'] += 1
         except queue.Empty:
             pass
+
         self._refresh_views()
         self.after(100, self.poll_queue)
+        self.update_protocol_chart()
 
+    
     def update_bandwidth_metrics(self):
-        rate=self.bytes_last; self.bytes_last=0
+        rate = self.bytes_last
+        self.bytes_last = 0
         self.lbl_bytes.configure(text=f"Total Bytes: {self.total_bytes}")
         self.lbl_rate.configure(text=f"Bytes/sec: {rate}")
-        # update chart
-        y=list(self.line.get_ydata())+ [rate]
-        x=list(range(len(y)))
-        self.chart_ax.clear(); self.chart_ax.plot(x,y)
+
+        self.byte_rate_history.append(rate)
+        if len(self.byte_rate_history) > 30:
+            self.byte_rate_history.pop(0)
+
+        self.chart_ax.clear()
+        self.chart_ax.plot(self.byte_rate_history)
         self.chart_canvas.draw_idle()
+
         self.after(1000, self.update_bandwidth_metrics)
 
     def apply_display_filter(self,*_): self._refresh_tree()
 
     def _refresh_views(self): self._refresh_tree(); self._refresh_talkers(); self.lbl_pkts.configure(text=f"Packets: {len(self.all_packets)}")
+    
+    def on_row_click(self, event):
+        selected_items = self.tree.selection()
+        if not selected_items:
+            return
+
+        selected = selected_items[0]
+        values = self.tree.item(selected, 'values')
+        if not values or len(values) != 7:
+            return
+
+        ts, src_ip, dst_ip, proto, sport, dport, length = values
+        index = self.tree.index(selected)
+        if index >= len(self.all_packets):
+            return
+
+        pkt = self.all_packets[index]
+        info = f"""--- General Info ---
+                Timestamp: {ts}
+                Source IP: {src_ip}
+                Destination IP: {dst_ip}
+                Protocol: {proto}
+                Source Port: {sport}
+                Destination Port: {dport}
+                Packet Length: {length} bytes
+                """
+
+        # GeoIP & Vendor Info
+        src_loc = self.geoip.lookup(src_ip)
+        dst_loc = self.geoip.lookup(dst_ip)
+        info += f"\n--- GeoIP & MAC Vendor ---\n"
+        info += f"Src GeoIP: {src_loc}\nDst GeoIP: {dst_loc}\n"
+
+        if pkt.haslayer(Ether):
+            eth = pkt[Ether]
+            src_mac = eth.src
+            dst_mac = eth.dst
+            if src_mac in self.mac_vendor_cache:
+                vendor = self.mac_vendor_cache[src_mac]
+            else:
+                try:
+                    vendor = self.vendor.lookup(src_mac)
+                except:
+                    vendor = "Unknown"
+                self.mac_vendor_cache[src_mac] = vendor
+            info += f"Src MAC: {src_mac} ({vendor})\nDst MAC: {dst_mac}\n"
+
+        # --- Protocol-Specific Deep Dives ---
+        if pkt.haslayer(DNSQR):
+            try:
+                qname = pkt[DNSQR].qname.decode(errors='ignore')
+                info += f"\n--- DNS ---\nQuery: {qname}\n"
+            except:
+                info += f"\n--- DNS ---\nQuery: [unreadable]\n"
+
+        if pkt.haslayer(DNSRR):
+            try:
+                rdata = pkt[DNSRR].rdata
+                if isinstance(rdata, bytes):
+                    rdata = rdata.decode(errors='ignore')
+                info += f"Answer: {rdata}\n"
+            except:
+                info += "Answer: [unreadable]\n"
+
+        if pkt.haslayer(HTTPRequest):
+            req = pkt[HTTPRequest]
+            info += "\n--- HTTP Request ---\n"
+            try:
+                info += f"Method: {req.Method.decode()}\n"
+                info += f"Host: {req.Host.decode()}\n"
+                info += f"Path: {req.Path.decode()}\n"
+            except:
+                info += "Headers: [partial/unreadable]\n"
+
+        if pkt.haslayer(HTTPResponse):
+            resp = pkt[HTTPResponse]
+            info += "\n--- HTTP Response ---\n"
+            info += f"Status Code: {resp.Status_Code}\n"
+
+        if pkt.haslayer(TLSClientHello):
+            try:
+                info += "\n--- TLS ---\n"
+                ch = pkt[TLSClientHello]
+                for ext in getattr(ch, 'extensions', []):
+                    if getattr(ext, 'name', '') == 'server_name':
+                        sni = ext.servernames[0].servername.decode(errors='ignore')
+                        info += f"SNI: {sni}\n"
+                        break
+            except:
+                info += "TLS Info: [unreadable]\n"
+
+        if pkt.haslayer('Raw'):
+            try:
+                raw_data = pkt['Raw'].load[:100]
+                if raw_data:
+                    hexed = ' '.join(f"{b:02x}" for b in raw_data)
+                    info += f"\n--- Hex Preview ---\n{hexed}\n"
+                else:
+                    info += "\n--- Hex Preview ---\n[empty payload]\n"
+            except:
+                info += "\n--- Hex Preview ---\n[error reading payload]\n"
+        else:
+            info += "\n--- Hex Preview ---\n[no raw layer in packet]\n"
+
+         # Show the info
+            popup = ctk.CTkToplevel(self)
+            popup.title("Packet Details")
+            popup.geometry("700x500")
+
+            ctk.CTkLabel(popup, text="Packet Details", font=self.header_font).pack(pady=5)
+            text_box = ctk.CTkTextbox(popup, wrap="word")
+            text_box.pack(fill="both", expand=True, padx=10, pady=10)
+
+            text_box.insert("1.0", info)
+            text_box.configure(state="normal")
+            text_box.focus_set()
+
+        # Then move the save prompt into a callback on popup close:
+        def on_close():
+            save = messagebox.askyesno("Save Info", "Would you like to save this packet info to a file?")
+            if save:
+                filepath = filedialog.asksaveasfilename(
+                    defaultextension=".txt",
+                    filetypes=[("Text Files", "*.txt")],
+                    title="Save Packet Details"
+                )
+                if filepath:
+                    try:
+                        with open(filepath, 'w') as f:
+                            f.write(info)
+                        messagebox.showinfo("Saved", f"Packet info saved to:\n{filepath}")
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Could not save file:\n{e}")
+
+        popup.protocol("WM_DELETE_WINDOW", on_close)
+
 
     def _refresh_tree(self):
-        for i in self.tree.get_children(): self.tree.delete(i)
-        flt=self.display_filter_var.get().lower()
-        for pkt in self.all_packets:
-            if flt and flt not in pkt.summary().lower(): continue
-            ts=datetime.datetime.fromtimestamp(pkt.time).strftime("%H:%M:%S")
-            proto='TCP' if pkt.haslayer(TCP) else 'UDP' if pkt.haslayer(UDP) else 'ICMP' if pkt.haslayer(ICMP) else ''
-            sp=pkt[TCP].sport if pkt.haslayer(TCP) else pkt[UDP].sport if pkt.haslayer(UDP) else ''
-            dp=pkt[TCP].dport if pkt.haslayer(TCP) else pkt[UDP].dport if pkt.haslayer(UDP) else ''
-            src=pkt[IP].src if pkt.haslayer(IP) else (pkt[IPv6].src if pkt.haslayer(IPv6) else '')
-            dst=pkt[IP].dst if pkt.haslayer(IP) else (pkt[IPv6].dst if pkt.haslayer(IPv6) else '')
-            ln=len(pkt)
-            self.tree.insert('', 'end', values=(ts,src,dst,proto,sp,dp,ln))
+        flt = self.display_filter_var.get().strip()
+        use_regex = any(c in flt for c in ".|*+?[](){}\\^$")
+
+        new_packets = self.all_packets[self.last_tree_index:]
+        for pkt in new_packets:
+            summary = pkt.summary()
+            if flt:
+                try:
+                    if use_regex and not re.search(flt, summary, re.IGNORECASE):
+                        continue
+                    elif not use_regex and flt.lower() not in summary.lower():
+                        continue
+                except re.error:
+                    continue
+
+            ts = datetime.datetime.fromtimestamp(pkt.time).strftime("%H:%M:%S")
+            proto = 'TCP' if pkt.haslayer(TCP) else 'UDP' if pkt.haslayer(UDP) else 'ICMP' if pkt.haslayer(ICMP) else ''
+            sp = pkt[TCP].sport if pkt.haslayer(TCP) else pkt[UDP].sport if pkt.haslayer(UDP) else ''
+            dp = pkt[TCP].dport if pkt.haslayer(TCP) else pkt[UDP].dport if pkt.haslayer(UDP) else ''
+            src = pkt[IP].src if pkt.haslayer(IP) else pkt[IPv6].src if pkt.haslayer(IPv6) else ''
+            dst = pkt[IP].dst if pkt.haslayer(IP) else pkt[IPv6].dst if pkt.haslayer(IPv6) else ''
+            ln = len(pkt)
+
+            self.tree.insert('', 'end', values=(ts, src, dst, proto, sp, dp, ln))
+
+        self.last_tree_index = len(self.all_packets)
 
     def _refresh_talkers(self):
         for i in self.talker.get_children(): self.talker.delete(i)
         for ip, cnt in sorted(self.bytes_per_src.items(), key=lambda x:-x[1])[:5]:
             self.talker.insert('', 'end', values=(ip,cnt))
+    
+    def open_rule_test_panel(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Test Signature Rules")
+        win.geometry("500x400")
 
+        ctk.CTkLabel(win, text="Enter Text to Test Against Signature Rules", font=self.header_font)\
+            .pack(pady=10)
+
+        entry = ctk.CTkTextbox(win, height=200, wrap='word')
+        entry.pack(fill='both', expand=True, padx=10)
+
+        output = ctk.CTkTextbox(win, height=150, wrap='word')
+        output.pack(fill='both', expand=True, padx=10, pady=(10, 5))
+        output.configure(state='disabled')
+
+        def run_test():
+            test_input = entry.get("1.0", "end").strip()
+            matches = self.sig_det._match_signatures(test_input)
+            output.configure(state='normal')
+            output.delete("1.0", "end")
+            if matches:
+                for m in matches:
+                    output.insert("end", f"{m}\n")
+            else:
+                output.insert("end", "No signature matched.")
+            output.configure(state='disabled')
+
+        ctk.CTkButton(win, text="Run Test", command=run_test).pack(pady=5)
+
+    def load_pcap(self):
+        filepath = filedialog.askopenfilename(
+            filetypes=[("PCAP Files", "*.pcap *.pcapng")],
+            title="Open PCAP File"
+        )
+        if not filepath:
+            return
+
+        try:
+            packets = rdpcap(filepath)
+            count = 0
+            for pkt in packets:
+                try:
+                    pkt.time = float(pkt.time)
+                    self.all_packets.append(pkt)
+                    length = len(pkt)
+                    self.total_bytes += length
+                    self.bytes_last += length
+
+                    # Get source IP if available
+                    src = pkt[IP].src if IP in pkt else pkt[IPv6].src if IPv6 in pkt else None
+                    if src:
+                        self.bytes_per_src[src] = self.bytes_per_src.get(src, 0) + length
+
+                    # Run detection engines
+                    for msg in self.sig_det.inspect(pkt):
+                        self.alerts.notify(msg, severity="HIGH")
+                    for msg in self.anom_det.inspect(pkt):
+                        self.alerts.notify(msg, severity="MEDIUM")
+
+                    # Update protocol counters
+                    if ARP in pkt:
+                        self.protocol_counts['ARP'] += 1
+                    elif IP in pkt:
+                        p = pkt[IP].proto
+                        if p == 6:
+                            self.protocol_counts['TCP'] += 1
+                        elif p == 17:
+                            self.protocol_counts['UDP'] += 1
+                        elif p == 1:
+                            self.protocol_counts['ICMP'] += 1
+                        else:
+                            self.protocol_counts['Other'] += 1
+
+                    count += 1
+                except Exception as inner_err:
+                    print(f"[WARN] Skipped packet due to error: {inner_err}")
+
+            self._refresh_views()
+            self.update_protocol_chart()  # <- immediate update
+            messagebox.showinfo("Load PCAP", f"Loaded {count} packets from:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load file:\n{e}")
+    
+    def update_protocol_chart(self):
+        labels = []
+        sizes = []
+        total = sum(self.protocol_counts.values())
+        if total == 0:
+            return
+
+        for proto, count in self.protocol_counts.items():
+            if count > 0:
+                labels.append(proto)
+                sizes.append(count)
+
+        self.ax_protocol.clear()
+        self.ax_protocol.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140)
+        self.ax_protocol.axis('equal')
+        self.pie_chart.draw_idle()
+        self.after(5000, self.update_protocol_chart)
+               
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument('-i','--iface', default=None)
