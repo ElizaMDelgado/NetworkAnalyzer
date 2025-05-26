@@ -5,6 +5,7 @@ A powerful Python-based network analyzer and packet sniffer with real-time traff
 [Dashboard Preview]
 
 
+![Dashbaord 5-24](https://github.com/user-attachments/assets/fb26a918-c4f4-4938-9c0d-12e18117a0a9)
 
 
 ---
