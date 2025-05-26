@@ -34,3 +34,40 @@ Install dependencies using pip:
 
 ```bash
 pip install -r requirements.txt
+
+📍 **Windows users:** Install [Npcap](https://nmap.org/npcap/) (enable "WinPcap API-compatible Mode") to enable packet capture.
+
+## ▶️ Usage
+
+```bash
+python packet_sniffer_gui.py -i "Ethernet"
+```
+
+### Optional arguments:
+- `-i`, `--iface` — Friendly name of the network interface (e.g., "Wi-Fi", "Ethernet")
+- `-p`, `--pcap` — Output file for saved packets (default: `out.pcap`)
+- `-c`, `--csv` — Output file for CSV data (default: `out.csv`)
+
+---
+
+## 📁 Project Structure
+
+| File | Description |
+|------|-------------|
+| `packet_sniffer_gui.py` | Main GUI application |
+| `signature_rules.json` | Signature rules for detection |
+| `out.pcap` | Saved packet capture |
+| `out.csv` | Exported CSV summary |
+
+---
+
+## 🖥️ GUI Overview
+
+- **Top Bar**: Interface selector, BPF filter, display filter, and control buttons
+- **Left Panel**: Live packet table
+- **Middle Panel**: Live metrics and bandwidth chart
+- **Right Panel**: Top talkers and protocol distribution
+- **Bottom**: Alert panel for anomalies and rule matches
+- **Popups**: Packet detail views with GeoIP, MAC vendor, and hex payload preview
+
+
