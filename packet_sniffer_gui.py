@@ -11,23 +11,19 @@ import time
 import sys
 import datetime
 import requests
+from collections import defaultdict
 from scapy.layers.l2 import ARP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.inet import TCP, UDP, ICMP, IP
 from scapy.layers.http import HTTPRequest, HTTPResponse
 from scapy.layers.dns import DNSQR, DNSRR
 from scapy.layers.tls.all import TLSClientHello
-from scapy.all import rdpcap
-from scapy.all import (
-    sniff, Ether, wrpcap, get_if_hwaddr,
-    get_if_list, hexdump, load_layer
-)
+from scapy.all import rdpcap, sniff, Ether, wrpcap, get_if_hwaddr, get_if_list, hexdump, load_layer
 from scapy.arch.windows import get_windows_if_list
 from mac_vendor_lookup import MacLookup
 
 import customtkinter as ctk
-from tkinter import ttk, messagebox
-from tkinter import messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
@@ -339,10 +335,11 @@ class AnomalyDetector:
         if self.n >= self.min_samples:
             σ = self.stddev()
             if σ > 0 and abs(length - self.mean) > self.threshold * σ:
-                alerts.append(
-                    f"Anomaly: packet size {length} B is >{self.threshold}σ "
-                    f"from mean ({self.mean:.1f}±{σ:.1f})"
-                )
+               alerts.append(
+               f"Anomaly: packet size {length} B is >{self.threshold}x "
+               f"from mean ({self.mean:.1f}±{σ:.1f})"
+            )
+
         self.update(length)
         return alerts
 
@@ -370,35 +367,32 @@ sig_det  = SignatureDetector('signature_rules.json')
 anom_det = AnomalyDetector()
 alerts   = AlertManager()  # will be re-bound to GUI below
 
+
 def process_packet_gui(packet, local_mac, gui, vendor_lookup=None):
+    """
+    Lightweight packet processing - just extract essential data and queue it.
+    Heavy processing is done in background thread.
+    """
     if Ether not in packet:
         return
     
-    # Run detections
-    for m in gui.sig_det.inspect(packet):
-        print("[SIG DETECTED]", m)
-        gui.alerts.notify(m, severity="HIGH")
-
-    for m in gui.anom_det.inspect(packet):
-        gui.alerts.notify(m, severity="MEDIUM")
-        
-    # Timestamp
+    # Quick timestamp extraction
     dt = datetime.datetime.fromtimestamp(float(packet.time))
-    ts = dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
+    ts = dt.strftime("%H:%M:%S.%f")[:-3]  # Only time, not full date for display
+    
+    # Quick protocol detection
     proto = src = dst = sport = dport = ""
-    # ---- handle ARP before any IP ----
+    length = len(packet)
+    
+    # Simplified protocol extraction
     if ARP in packet:
-        arp   = packet[ARP]
+        arp = packet[ARP]
         proto = "ARP"
-        src   = arp.psrc    # sender IP
-        dst   = arp.pdst    # target IP
-
-    # ---- handle IPv6 ----
+        src = arp.psrc
+        dst = arp.pdst
     elif IPv6 in packet:
         ipv6 = packet[IPv6]
-        # next-header numbers: 6=TCP, 17=UDP, 58=ICMPv6
-        proto = {6:'TCP',17:'UDP',58:'ICMPv6'}.get(ipv6.nh, str(ipv6.nh))
+        proto = {6:'TCP', 17:'UDP', 58:'ICMPv6'}.get(ipv6.nh, str(ipv6.nh))
         src, dst = ipv6.src, ipv6.dst
         if proto == 'TCP' and packet.haslayer(TCP):
             tcp = packet[TCP]
@@ -406,11 +400,9 @@ def process_packet_gui(packet, local_mac, gui, vendor_lookup=None):
         elif proto == 'UDP' and packet.haslayer(UDP):
             udp = packet[UDP]
             sport, dport = udp.sport, udp.dport
-
-    # ---- fallback to IPv4 ----
     elif IP in packet:
-        ip    = packet[IP]
-        proto = {1:'ICMP',6:'TCP',17:'UDP'}.get(ip.proto, str(ip.proto))
+        ip = packet[IP]
+        proto = {1:'ICMP', 6:'TCP', 17:'UDP'}.get(ip.proto, str(ip.proto))
         src, dst = ip.src, ip.dst
         if proto == 'TCP' and packet.haslayer(TCP):
             tcp = packet[TCP]
@@ -419,15 +411,41 @@ def process_packet_gui(packet, local_mac, gui, vendor_lookup=None):
             udp = packet[UDP]
             sport, dport = udp.sport, udp.dport
 
-    length = len(packet)
-    row    = [ts, src, dst, proto, sport, dport, length]
-    csv_data.append(row)
-    packet_queue.put(packet)
+    # Create lightweight packet data for GUI
+    packet_data = {
+        'timestamp': ts,
+        'src': src,
+        'dst': dst,
+        'protocol': proto,
+        'sport': sport,
+        'dport': dport,
+        'length': length,
+        'raw_packet': packet  # Keep reference for detailed analysis
+    }
+    
+    # Queue for GUI processing (non-blocking)
+    try:
+        packet_queue.put_nowait(packet_data)
+    except queue.Full:
+        # Drop packets if queue is full to prevent memory issues
+        pass
+    
+    # Queue for background analysis (separate queue)
+    try:
+        gui.analysis_queue.put_nowait(packet)
+    except queue.Full:
+        pass
 
 class SnifferApp(ctk.CTk):
-    MAX_PACKETS = 1000  # Limit memory usage and improve GUI responsiveness
+    MAX_PACKETS = 500  # Limit memory usage and improve GUI responsiveness
+    
     def __init__(self, interface, pcap_file, csv_file):
         super().__init__()
+        self.sessions = defaultdict(list)
+        
+        # Define constants FIRST, before using them
+        self.MAX_QUEUE_SIZE = 2000  # Move this line up here
+        
         self.interface = interface
         self.pcap_file = pcap_file
         self.csv_file = csv_file
@@ -436,10 +454,14 @@ class SnifferApp(ctk.CTk):
         self.geoip = GeoIPResolver()
         self.protocol_counts = {'TCP': 0, 'UDP': 0, 'ICMP': 0, 'ARP': 0, 'Other': 0}
         self.byte_rate_history = []
+        
+        self.memory_check_counter = 0
 
         # ── Theme setup ──
-        ctk.set_appearance_mode('Light')
+        self.theme_var = ctk.StringVar(value='Light')  # Set default theme
+        ctk.set_appearance_mode(self.theme_var.get())
         ctk.set_default_color_theme('blue')
+
 
         # ── DEFINE YOUR FONTS HERE ──
         self.text_font   = ctk.CTkFont(size=14)
@@ -479,15 +501,111 @@ class SnifferApp(ctk.CTk):
         self.after(1000, self.update_bandwidth_metrics)
         self.after(5000, self.update_protocol_chart)
 
-
         self.last_tree_index = 0
         self.mac_vendor_cache = {}
         
+        # Initialize queues AFTER MAX_QUEUE_SIZE is defined
+        global packet_queue
+        packet_queue = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
+        
+        # Separate queue for background analysis
+        self.analysis_queue = queue.Queue(maxsize=1000)  # Limit queue size
+        self.analysis_results_queue = queue.Queue(maxsize=500)
+        
+        # Background analysis thread
+        self.analysis_thread = threading.Thread(target=self._background_analysis_worker, daemon=True)
+        self.analysis_thread.start()
+        
+        # Start background analysis results polling
+        self.after(200, self.poll_analysis_results)
+    
+    def reconstruct_stream(self, key):
+        """Reconstruct payload stream for a given TCP session key."""
+        packets = self.sessions.get(key, [])
+        if not packets:
+            return b""
+        # Sort by sequence number and concatenate payloads
+        packets.sort()
+        return b''.join(bytes(payload) for _, payload in packets if bytes(payload))
 
+    
+    def _background_analysis_worker(self):
+        """
+        Background thread that runs signature and anomaly detection
+        on packets received in the analysis_queue.
+        """
+        while True:
+            try:
+                pkt = self.analysis_queue.get(timeout=1)
+                sig_alerts = self.sig_det.inspect(pkt)
+                anom_alerts = self.anom_det.inspect(pkt)
+                for msg in sig_alerts:
+                    self.analysis_results_queue.put(("HIGH", msg))
+                for msg in anom_alerts:
+                    self.analysis_results_queue.put(("MEDIUM", msg))
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[ERROR] in analysis worker: {e}")
+
+    def poll_analysis_results(self):
+        """
+        Periodically checks for results from background analysis
+        and pushes them to the alert system.
+        """
+        try:
+            while True:
+                severity, msg = self.analysis_results_queue.get_nowait()
+                self.alerts.notify(msg, severity)
+        except queue.Empty:
+            pass
+        self.after(300, self.poll_analysis_results)
+
+    
+    def _memory_cleanup(self):
+        """
+        Periodic memory cleanup to prevent memory leaks
+        """
+        # Clean up old GeoIP cache entries
+        if len(self.geoip.cache) > 1000:
+            # Keep only the 500 most recent entries
+            items = list(self.geoip.cache.items())
+            self.geoip.cache = dict(items[-500:])
+        
+        # Clean up MAC vendor cache
+        if len(self.mac_vendor_cache) > 500:
+            items = list(self.mac_vendor_cache.items())
+            self.mac_vendor_cache = dict(items[-250:])
+        
+        # Clean up top talkers if too many
+        if len(self.bytes_per_src) > 200:
+            # Keep only top 100 talkers
+            sorted_talkers = sorted(self.bytes_per_src.items(), key=lambda x: x[1], reverse=True)
+            self.bytes_per_src = dict(sorted_talkers[:100])
+        
+        # Clean up rate history
+        if len(self.byte_rate_history) > 60:  # Keep last 60 seconds
+            self.byte_rate_history = self.byte_rate_history[-30:]
+            
     def _build_capture_controls(self):
         frame = ctk.CTkFrame(self, corner_radius=8)
         frame.grid(row=0, column=0, sticky='ew', padx=10, pady=5)
 
+                # ─── Dark Mode Switch ───
+        self.dark_mode_var = ctk.BooleanVar(value=False)
+
+        def toggle_theme():
+            mode = 'Dark' if self.dark_mode_var.get() else 'Light'
+            ctk.set_appearance_mode(mode)
+
+        theme_switch = ctk.CTkSwitch(
+            frame, text='Dark Mode',
+            variable=self.dark_mode_var,
+            command=toggle_theme
+        )
+        theme_switch.grid(row=0, column=9, padx=5)
+
+    
         # Configure grid columns and rows
         for col in range(0, 10):  # allow space for extra buttons
             frame.grid_columnconfigure(col, weight=0)
@@ -569,6 +687,7 @@ class SnifferApp(ctk.CTk):
                 frame, text=txt, command=cmd,
                 width=80, height=28, font=self.text_font
             ).grid(row=1, column=idx, padx=4, pady=(3, 0))
+        
 
     def _build_paned_view(self):
         pane = ctk.CTkFrame(self)
@@ -663,19 +782,41 @@ class SnifferApp(ctk.CTk):
     def start_capture(self):
         iface = self.iface_var.get()
         stop_sniff_event.clear()
-        self.start_btn.configure(state='disabled'); self.stop_btn.configure(state='normal')
-        threading.Thread(target=lambda: sniff(
-            iface=iface, filter=self.capture_filter_var.get() or None,
-            prn=lambda p: process_packet_gui(p, self.local_mac, self, self.vendor),
-            store=True, promisc=True,
-            stop_filter=lambda p: stop_sniff_event.is_set()
-        ), daemon=True).start()
+        self.start_btn.configure(state='disabled')
+        self.stop_btn.configure(state='normal')
+
+        bpf_filter = self.capture_filter_var.get().strip()
+        if not bpf_filter:
+            bpf_filter = None  # No filter
+
+        def safe_sniff():
+            try:
+                sniff(
+                    iface=iface,
+                    filter=bpf_filter,
+                    prn=lambda p: process_packet_gui(p, self.local_mac, self, self.vendor),
+                    store=True,
+                    promisc=True,
+                    stop_filter=lambda p: stop_sniff_event.is_set()
+                )
+            except Exception as e:
+                print(f"[ERROR] Failed to start sniffing: {e}")
+                messagebox.showerror("Sniff Error", f"Failed to start sniffing:\n{e}")
+                self.start_btn.configure(state='normal')
+                self.stop_btn.configure(state='disabled')
+
+        threading.Thread(target=safe_sniff, daemon=True).start()
 
     def stop_capture(self):
         stop_sniff_event.set(); self.stop_btn.configure(state='disabled'); self.start_btn.configure(state='normal')
 
     def reload_rules(self):
-        self.sig_det.reload_rules(); messagebox.showinfo('Reload','Rules reloaded')
+        try:
+            self.sig_det.reload_rules()
+            self.alerts.notify("Signature rules reloaded.", severity="INFO")
+        except Exception as e:
+            self.alerts.notify(f"Error reloading rules: {e}", severity="HIGH")
+        messagebox.showinfo('Reload', 'Rules reloaded')
 
     def save_csv(self):
         with open(self.csv_file,'w',newline='') as f:
@@ -717,59 +858,169 @@ class SnifferApp(ctk.CTk):
         ctk.CTkButton(self.cat_win, text="Apply", command=apply_changes).pack(pady=10)
 
     # -- Poll & update --
-    
     def poll_queue(self):
+        """
+        Optimized polling that processes packets in batches and limits GUI updates
+        """
+        packets_processed = 0
+        max_batch_size = 50  # Process max 50 packets per poll cycle
+
         try:
-            while True:
-                pkt = packet_queue.get_nowait()
-                self.all_packets.append(pkt)
+            while packets_processed < max_batch_size:
+                packet_data = packet_queue.get_nowait()
+
+                # Add to packet storage with memory limit
+                self.all_packets.append(packet_data['raw_packet'])
                 if len(self.all_packets) > self.MAX_PACKETS:
-                    self.all_packets.pop(0)
-                length = len(pkt)
+                    removed_count = len(self.all_packets) - self.MAX_PACKETS
+                    self.all_packets = self.all_packets[removed_count:]
+                    self.last_tree_index = max(0, self.last_tree_index - removed_count)
+
+                # Update statistics
+                length = packet_data['length']
                 self.total_bytes += length
                 self.bytes_last += length
 
-                src = pkt[IP].src if IP in pkt else pkt[IPv6].src if IPv6 in pkt else None
+                # Update bytes per source (for top talkers)
+                src = packet_data['src']
                 if src:
                     self.bytes_per_src[src] = self.bytes_per_src.get(src, 0) + length
 
-                # Protocol counting
-                if ARP in pkt:
+                # Update protocol counters
+                proto = packet_data['protocol']
+                if proto == 'ARP':
                     self.protocol_counts['ARP'] += 1
-                elif IP in pkt:
-                    p = pkt[IP].proto
-                    if p == 6:
-                        self.protocol_counts['TCP'] += 1
-                    elif p == 17:
-                        self.protocol_counts['UDP'] += 1
-                    elif p == 1:
-                        self.protocol_counts['ICMP'] += 1
-                    else:
-                        self.protocol_counts['Other'] += 1
+                elif proto == 'TCP':
+                    self.protocol_counts['TCP'] += 1
+                elif proto == 'UDP':
+                    self.protocol_counts['UDP'] += 1
+                elif proto == 'ICMP':
+                    self.protocol_counts['ICMP'] += 1
+                else:
+                    self.protocol_counts['Other'] += 1
+
+                # Session tracking
+                if IP in packet_data['raw_packet'] and TCP in packet_data['raw_packet']:
+                    ip_pkt = packet_data['raw_packet'][IP]
+                    tcp_pkt = packet_data['raw_packet'][TCP]
+                    key = tuple(sorted([
+                        (ip_pkt.src, tcp_pkt.sport),
+                        (ip_pkt.dst, tcp_pkt.dport)
+                    ]))
+                    self.sessions[key].append((tcp_pkt.seq, tcp_pkt.payload))
+
+                packets_processed += 1
+
         except queue.Empty:
             pass
 
-        self._refresh_views()
-        self.after(100, self.poll_queue)
-        self.update_protocol_chart()
+        if packets_processed > 0:
+            self.lbl_pkts.configure(text=f"Packets: {len(self.all_packets)}")
 
-    
+            if packets_processed >= 10 or len(self.all_packets) % 25 == 0:
+                self._refresh_tree()
+
+            if len(self.all_packets) % 20 == 0:
+                self._refresh_talkers()
+
+        next_poll_time = 100 if packets_processed > 20 else 300
+        self.after(next_poll_time, self.poll_queue)
+
+   
     def update_bandwidth_metrics(self):
+        """
+        Optimized bandwidth metrics with reduced chart redraws
+        """
         rate = self.bytes_last
         self.bytes_last = 0
-        self.lbl_bytes.configure(text=f"Total Bytes: {self.total_bytes}")
-        self.lbl_rate.configure(text=f"Bytes/sec: {rate}")
-
+        
+        # Update text labels (fast)
+        self.lbl_bytes.configure(text=f"Total Bytes: {self.total_bytes:,}")
+        self.lbl_rate.configure(text=f"Bytes/sec: {rate:,}")
+        
+        # Update rate history
         self.byte_rate_history.append(rate)
         if len(self.byte_rate_history) > 30:
             self.byte_rate_history.pop(0)
-
-        self.chart_ax.clear()
-        self.chart_ax.plot(self.byte_rate_history)
-        self.chart_canvas.draw_idle()
-
+        
+        # Only redraw chart if there's significant change or every 5 seconds
+        should_update_chart = (
+            not hasattr(self, '_last_chart_update') or
+            time.time() - self._last_chart_update > 5.0 or
+            (rate > 0 and len(self.byte_rate_history) % 5 == 0)
+        )
+        
+        if should_update_chart and self.byte_rate_history:
+            try:
+                self.chart_ax.clear()
+                self.chart_ax.plot(self.byte_rate_history, 'b-', linewidth=1)
+                self.chart_ax.set_title('Bytes/sec', fontsize=10)
+                self.chart_ax.grid(True, alpha=0.3)
+                
+                # Optimize chart appearance
+                self.chart_ax.tick_params(labelsize=8)
+                self.chart_canvas.draw_idle()  # Use draw_idle instead of draw
+                self._last_chart_update = time.time()
+            except Exception as e:
+                print(f"Chart update error: {e}")
+        
         self.after(1000, self.update_bandwidth_metrics)
 
+    def update_protocol_chart(self):
+        """
+        Optimized protocol chart with less frequent updates
+        """
+        # Only update every 5 seconds or if significant changes
+        if (hasattr(self, '_last_pie_update') and 
+            time.time() - self._last_pie_update < 5.0):
+            self.after(5000, self.update_protocol_chart)
+            return
+        
+        total = sum(self.protocol_counts.values())
+        if total == 0:
+            self.after(5000, self.update_protocol_chart)
+            return
+        
+        # Only update if counts have changed significantly
+        current_counts = dict(self.protocol_counts)
+        if (hasattr(self, '_last_protocol_counts') and 
+            current_counts == self._last_protocol_counts):
+            self.after(5000, self.update_protocol_chart)
+            return
+        
+        try:
+            # Prepare data
+            labels = []
+            sizes = []
+            colors = ['#ff9999', '#66b3ff', '#99ff99', '#ffcc99', '#ff99cc']
+            
+            for i, (proto, count) in enumerate(self.protocol_counts.items()):
+                if count > 0:
+                    labels.append(f"{proto}\n({count})")
+                    sizes.append(count)
+            
+            if sizes:
+                self.ax_protocol.clear()
+                wedges, texts, autotexts = self.ax_protocol.pie(
+                    sizes, 
+                    labels=labels, 
+                    autopct='%1.1f%%', 
+                    startangle=140,
+                    colors=colors[:len(sizes)],
+                    textprops={'fontsize': 8}
+                )
+                
+                self.ax_protocol.set_title('Protocol Distribution', fontsize=10)
+                self.pie_chart.draw_idle()
+                
+            self._last_pie_update = time.time()
+            self._last_protocol_counts = current_counts.copy()
+            
+        except Exception as e:
+            print(f"Protocol chart update error: {e}")
+        
+        self.after(5000, self.update_protocol_chart)
+    
     def apply_display_filter(self,*_): self._refresh_tree()
 
     def _refresh_views(self): self._refresh_tree(); self._refresh_talkers(); self.lbl_pkts.configure(text=f"Packets: {len(self.all_packets)}")
@@ -878,17 +1129,50 @@ class SnifferApp(ctk.CTk):
             info += "\n--- Hex Preview ---\n[no raw layer in packet]\n"
 
          # Show the info
-            popup = ctk.CTkToplevel(self)
-            popup.title("Packet Details")
-            popup.geometry("700x500")
+        popup = ctk.CTkToplevel(self)
+        popup.title("Packet Details")
+        popup.geometry("700x500")
 
-            ctk.CTkLabel(popup, text="Packet Details", font=self.header_font).pack(pady=5)
-            text_box = ctk.CTkTextbox(popup, wrap="word")
-            text_box.pack(fill="both", expand=True, padx=10, pady=10)
+        ctk.CTkLabel(popup, text="Packet Details", font=self.header_font).pack(pady=5)
+        text_box = ctk.CTkTextbox(popup, wrap="word")
+        text_box.pack(fill="both", expand=True, padx=10, pady=10)
 
-            text_box.insert("1.0", info)
-            text_box.configure(state="normal")
-            text_box.focus_set()
+        text_box.insert("1.0", info)
+        text_box.configure(state="normal")
+        text_box.focus_set()
+        
+        if pkt.haslayer(IP) and pkt.haslayer(TCP):
+            ip_layer = pkt[IP]
+            tcp_layer = pkt[TCP]
+            key = tuple(sorted([
+            (ip_layer.src, tcp_layer.sport),
+            (ip_layer.dst, tcp_layer.dport)
+        ]))
+
+            def show_session():
+                stream = self.reconstruct_stream(key)
+                sess_win = ctk.CTkToplevel(self)
+                sess_win.title("Reconstructed TCP Stream")
+                sess_win.geometry("700x400")
+
+                sess_text = ctk.CTkTextbox(sess_win, wrap="word")
+                sess_text.pack(expand=True, fill="both", padx=10, pady=10)
+
+                if stream.startswith(b'\x16\x03') or stream.startswith(b'\x17\x03'):
+                    sess_text.insert("end", "[TLS-encrypted stream — contents not human-readable]")
+                elif stream:
+                    try:
+                        decoded = stream.decode(errors="replace").strip()
+                        if decoded:
+                            sess_text.insert("end", decoded)
+                        else:
+                            sess_text.insert("end", "[No session data available]")
+                    except Exception as e:
+                        sess_text.insert("end", f"[Error decoding stream: {e}]")
+                else:
+                    sess_text.insert("end", "[No session data available]")
+
+            ctk.CTkButton(popup, text="Reassembled TCP Stream", command=show_session).pack(pady=10)
 
         # Then move the save prompt into a callback on popup close:
         def on_close():
@@ -909,34 +1193,98 @@ class SnifferApp(ctk.CTk):
 
         popup.protocol("WM_DELETE_WINDOW", on_close)
 
-
     def _refresh_tree(self):
-        flt = self.display_filter_var.get().strip()
-        use_regex = any(c in flt for c in ".|*+?[](){}\\^$")
+        """
+        Optimized tree refresh - only adds new packets, doesn't rebuild entire tree
+        """
+        flt = self.display_filter_var.get().strip().lower()
+        use_regex = any(c in flt for c in ".|*+?[](){}\\^$") if flt else False
 
-        new_packets = self.all_packets[self.last_tree_index:]
-        for pkt in new_packets:
-            summary = pkt.summary()
-            if flt:
-                try:
-                    if use_regex and not re.search(flt, summary, re.IGNORECASE):
-                        continue
-                    elif not use_regex and flt.lower() not in summary.lower():
-                        continue
-                except re.error:
-                    continue
+        # Only process new packets since last update
+        packets_to_add = []
+        start_index = max(0, self.last_tree_index)
 
-            ts = datetime.datetime.fromtimestamp(pkt.time).strftime("%H:%M:%S")
-            proto = 'TCP' if pkt.haslayer(TCP) else 'UDP' if pkt.haslayer(UDP) else 'ICMP' if pkt.haslayer(ICMP) else ''
-            sp = pkt[TCP].sport if pkt.haslayer(TCP) else pkt[UDP].sport if pkt.haslayer(UDP) else ''
-            dp = pkt[TCP].dport if pkt.haslayer(TCP) else pkt[UDP].dport if pkt.haslayer(UDP) else ''
-            src = pkt[IP].src if pkt.haslayer(IP) else pkt[IPv6].src if pkt.haslayer(IPv6) else ''
-            dst = pkt[IP].dst if pkt.haslayer(IP) else pkt[IPv6].dst if pkt.haslayer(IPv6) else ''
-            ln = len(pkt)
+        for i, pkt in enumerate(self.all_packets[start_index:], start_index):
+            try:
+                # Determine protocol for precise filtering
+                if pkt.haslayer(TCP):
+                    proto = 'tcp'
+                    sp, dp = pkt[TCP].sport, pkt[TCP].dport
+                elif pkt.haslayer(UDP):
+                    proto = 'udp'
+                    sp, dp = pkt[UDP].sport, pkt[UDP].dport
+                elif pkt.haslayer(ICMP):
+                    proto = 'icmp'
+                    sp = dp = ''
+                elif pkt.haslayer(ARP):
+                    proto = 'arp'
+                    sp = dp = ''
+                else:
+                    proto = 'other'
+                    sp = dp = ''
 
-            self.tree.insert('', 'end', values=(ts, src, dst, proto, sp, dp, ln))
+                # Apply filter based on exact match or regex
+                if flt:
+                    if use_regex:
+                        try:
+                            if not re.search(flt, proto, re.IGNORECASE):
+                                continue
+                        except re.error:
+                            continue
+                    else:
+                        if flt != proto:
+                            continue
+
+                # Extract display data efficiently
+                ts = datetime.datetime.fromtimestamp(pkt.time).strftime("%H:%M:%S")
+
+                # Get IP addresses
+                if pkt.haslayer(IP):
+                    src, dst = pkt[IP].src, pkt[IP].dst
+                elif pkt.haslayer(IPv6):
+                    src, dst = pkt[IPv6].src, pkt[IPv6].dst
+                elif pkt.haslayer(ARP):
+                    src, dst = pkt[ARP].psrc, pkt[ARP].pdst
+                else:
+                    src = dst = ''
+
+                packets_to_add.append((ts, src, dst, proto.upper(), sp, dp, len(pkt)))
+
+            except Exception as e:
+                # Skip problematic packets
+                continue
+
+        # Batch insert new rows
+        if packets_to_add:
+            # Limit tree size to prevent GUI slowdown
+            current_count = len(self.tree.get_children())
+            if current_count > self.MAX_PACKETS:
+                # Remove oldest entries
+                children = self.tree.get_children()
+                for child in children[:len(children) - self.MAX_PACKETS + len(packets_to_add)]:
+                    self.tree.delete(child)
+
+            # Add new packets
+            for row_data in packets_to_add:
+                self.tree.insert('', 'end', values=row_data)
+
+            # Auto-scroll to bottom if user hasn't manually scrolled
+            if not hasattr(self, '_user_scrolled') or not self._user_scrolled:
+                children = self.tree.get_children()
+                if children:
+                    self.tree.see(children[-1])
 
         self.last_tree_index = len(self.all_packets)
+
+
+    # Add this method to track user scrolling behavior:
+    def _on_tree_scroll(self, event):
+        """Track if user has manually scrolled the tree"""
+        self._user_scrolled = True
+        # Reset after 5 seconds of no scrolling
+        if hasattr(self, '_scroll_timer'):
+            self.after_cancel(self._scroll_timer)
+        self._scroll_timer = self.after(5000, lambda: setattr(self, '_user_scrolled', False))
 
     def _refresh_talkers(self):
         for i in self.talker.get_children(): self.talker.delete(i)
@@ -1026,24 +1374,6 @@ class SnifferApp(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Error", f"Could not load file:\n{e}")
     
-    def update_protocol_chart(self):
-        labels = []
-        sizes = []
-        total = sum(self.protocol_counts.values())
-        if total == 0:
-            return
-
-        for proto, count in self.protocol_counts.items():
-            if count > 0:
-                labels.append(proto)
-                sizes.append(count)
-
-        self.ax_protocol.clear()
-        self.ax_protocol.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140)
-        self.ax_protocol.axis('equal')
-        self.pie_chart.draw_idle()
-        self.after(5000, self.update_protocol_chart)
-               
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument('-i','--iface', default=None)
