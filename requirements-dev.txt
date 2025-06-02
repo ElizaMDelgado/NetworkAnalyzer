@@ -1,5 +1,8 @@
 pytest
 hypothesis
+coverage
 scapy
 mac-vendor-lookup
-coverage
+customtkinter
+matplotlib
+requests
