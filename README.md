@@ -1,4 +1,4 @@
-# 🕵️ Network Analyzer & Packet Sniffer
+#  Network Analyzer & Packet Sniffer
 
 A powerful Python-based network analyzer and packet sniffer with real-time traffic inspection, GUI dashboard, protocol breakdown charts, anomaly detection, signature-based alerts, GeoIP lookups, and PCAP import/export.
 
@@ -10,7 +10,7 @@ A powerful Python-based network analyzer and packet sniffer with real-time traff
 
 ---
 
-## 🚀 Features
+## Features
 
 - **Live Packet Capture** using Scapy
 - **Signature-Based Detection** via JSON regex rules
@@ -28,20 +28,57 @@ A powerful Python-based network analyzer and packet sniffer with real-time traff
 
 ---
 
-## 🛠 Requirements
+## Steps to Run Network Analyzer
+Follow these steps to install the required dependencies and run the project locally on Windows.
+### 1. Install Python 3.11
 
-Install dependencies using pip:
+   Download Python 3.11 from the official site:
+    👉 https://www.python.org/downloads/windows/
 
+  On the installer screen, make sure to check:
+    ✔️ “Add Python 3.11 to PATH”
+
+   Complete the installation.
+
+To verify:
+
+Open PowerShell or Command Prompt and run:
 ```bash
-pip install -r requirements.txt
-
-📍 **Windows users:** Install [Npcap](https://nmap.org/npcap/) (enable "WinPcap API-compatible Mode") to enable packet capture.
-
-## ▶️ Usage
-
-```bash
-python packet_sniffer_gui.py -i "Ethernet"
+python --version
 ```
+
+Expected output:
+```bash
+Python 3.11.x
+```
+
+### 2. Install Microsoft Visual C++ Build Tools
+
+Some dependencies (e.g., matplotlib) require build tools to compile.
+
+  Download the C++ Build Tools:
+    👉 https://visualstudio.microsoft.com/visual-cpp-build-tools/
+
+  During installation, select:
+    ✔️ "Desktop development with C++"
+
+  This ensures you have Visual C++ 14.0 or newer, required for building native extensions.
+
+### 3. Install Python Dependencies
+
+   Once Python and C++ tools are set up, run the following command:
+```bash
+python -m pip install scapy mac-vendor-lookup customtkinter matplotlib requests pytest hypothesis coverage --only-binary matplotlib
+```
+   This installs all runtime and development packages needed for the GUI, packet capture, and testing.
+
+### 4. Run the Application
+ 
+   Navigate to the project folder (where packet_sniffer_gui.py is located) and run:
+```bash
+python packet_sniffer_gui.py
+```
+
 
 ### Optional arguments:
 - `-i`, `--iface` — Friendly name of the network interface (e.g., "Wi-Fi", "Ethernet")
