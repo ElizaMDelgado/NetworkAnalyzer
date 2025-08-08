@@ -59,12 +59,24 @@ Some dependencies (e.g., matplotlib) require build tools to compile.
   Download the C++ Build Tools:
     👉 https://visualstudio.microsoft.com/visual-cpp-build-tools/
 
-  During installation, select:
+  **During installation, select:**
     ✔️ "Desktop development with C++"
 
   This ensures you have Visual C++ 14.0 or newer, required for building native extensions.
 
-### 3. Install Python Dependencies
+### 3. Install Npcap  
+Npcap is a modern, secure replacement for WinPcap, and fully supported by Scapy.
+
+   Download Npcap here:
+    👉 https://npcap.com/#download
+
+  **During installation:**
+
+   ✅ Check: “Install Npcap in WinPcap API-compatible Mode”
+
+   ✅ Allow installation for all users
+
+### 4. Install Python Dependencies
 
    Once Python and C++ tools are set up, run the following command:
 ```bash
@@ -72,7 +84,7 @@ python -m pip install scapy mac-vendor-lookup customtkinter matplotlib requests 
 ```
    This installs all runtime and development packages needed for the GUI, packet capture, and testing.
 
-### 4. Run the Application
+### 5. Run the Application
  
    Navigate to the project folder (where packet_sniffer_gui.py is located) and run:
 ```bash
