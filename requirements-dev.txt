@@ -1,8 +1,4 @@
 pytest
 hypothesis
 coverage
-scapy
-mac-vendor-lookup
-customtkinter
-matplotlib
-requests
+-r requirements.txt
