@@ -28,7 +28,7 @@ A powerful Python-based network analyzer and packet sniffer with real-time traff
 
 ---
 
-## Steps to Run Network Analyzer
+## Steps to Run The Network Analyzer
 Follow these steps to install the required dependencies and run the project locally on Windows.
 ### 1. Install Python 3.11
 
