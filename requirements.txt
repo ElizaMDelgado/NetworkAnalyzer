@@ -1,0 +1,5 @@
+scapy
+mac-vendor-lookup
+customtkinter
+matplotlib
+requests
